@@ -1,0 +1,11 @@
+.env
+venv/
+data/odds_raw/
+data/elo_history.csv
+data/pitcher_elo_history.csv
+data/features.csv
+data/gbm_predictions.csv
+data/bet_log.csv
+__pycache__/
+.DS_Store
+
