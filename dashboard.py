@@ -22,10 +22,18 @@ DATA = Path(__file__).parent / "data"
 
 
 def load_api_key():
-    env = (Path(__file__).parent / ".env").read_text()
-    for line in env.splitlines():
-        if line.startswith("ODDS_API_KEY="):
-            return line.split("=", 1)[1].strip()
+    # Streamlit Cloud secrets first (production)
+    try:
+        if "ODDS_API_KEY" in st.secrets:
+            return st.secrets["ODDS_API_KEY"]
+    except Exception:
+        pass
+    # Local .env fallback (development)
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("ODDS_API_KEY="):
+                return line.split("=", 1)[1].strip()
     return None
 
 
