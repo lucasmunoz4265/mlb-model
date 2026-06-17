@@ -183,7 +183,7 @@ def main():
     rows = compute_edges(rows)
     rows.sort(key=lambda r: max(r["edge_home"], r["edge_away"]), reverse=True)
 
-    tab1, tab2, tab3 = st.tabs(["🎯 Recommended Bets", "📋 Full Slate", "📈 Performance"])
+    tab1, tab2, tab_bet, tab3 = st.tabs(["🎯 Recommended Bets", "📋 Full Slate", "📝 Place a Bet", "📈 Performance"])
 
     with tab1:
         recs = []
@@ -252,16 +252,109 @@ def main():
             } for r in rows])
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+    with tab_bet:
+        st.subheader("📝 Log a bet you placed")
+        st.caption("Use this to track YOUR actual bets — model picks, gut picks, props, anything.")
+
+        bet_kind = st.radio("What kind of bet?", ["Tonight's moneyline", "Custom / prop / other"],
+                            horizontal=True)
+
+        if bet_kind == "Tonight's moneyline":
+            if not rows:
+                st.info("No games loaded yet.")
+            else:
+                game_labels = [f"{r['away']} @ {r['home']}" for r in rows]
+                pick = st.selectbox("Game", game_labels)
+                game = rows[game_labels.index(pick)]
+                side_label = st.radio(
+                    "Side",
+                    [f"{game['away']} ({format_american(game['ml_away'])})",
+                     f"{game['home']} ({format_american(game['ml_home'])})"],
+                    horizontal=True,
+                )
+                if side_label.startswith(game["home"]):
+                    side, team, default_odds = "home", game["home"], int(game["ml_home"])
+                    pitcher, opp_pitcher = game["home_pitcher"], game["away_pitcher"]
+                    model_p_val = game["p_home"]
+                    market_p_val = game["market_p_home"]
+                    edge_val = game["edge_home"]
+                else:
+                    side, team, default_odds = "away", game["away"], int(game["ml_away"])
+                    pitcher, opp_pitcher = game["away_pitcher"], game["home_pitcher"]
+                    model_p_val = 1 - game["p_home"]
+                    market_p_val = 1 - game["market_p_home"]
+                    edge_val = game["edge_away"]
+
+                c1, c2 = st.columns(2)
+                odds = c1.number_input("Odds (American)", value=default_odds, step=5)
+                stake = c2.number_input("Stake ($)", min_value=0.01, value=5.0, step=0.5)
+
+                st.caption(f"Model: {model_p_val*100:.1f}%  •  Market (no-vig): {market_p_val*100:.1f}%  •  Edge: {edge_val*100:+.1f}%")
+
+                if st.button("✅ Log this bet"):
+                    from datetime import datetime
+                    decimal = american_to_decimal(odds)
+                    log_bet({
+                        "logged_at": datetime.now().isoformat(timespec="seconds"),
+                        "game_date": game["game_date"],
+                        "game_id": game["game_id"],
+                        "home_team": game["home"], "away_team": game["away"],
+                        "bet_side": side, "bet_team": team,
+                        "pitcher": pitcher, "opp_pitcher": opp_pitcher,
+                        "odds_american": odds, "odds_decimal": round(decimal, 4),
+                        "model_p": round(model_p_val, 4),
+                        "market_p": round(market_p_val, 4),
+                        "edge": round(edge_val, 4),
+                        "stake": round(stake, 2),
+                        "source": "manual", "bet_type": "moneyline", "description": "",
+                    })
+                    st.success(f"Logged: {team} ML at {format_american(odds)} for ${stake:.2f}")
+                    st.rerun()
+
+        else:
+            st.markdown("For player props, parlays, futures, or any bet without a clean ML/total match.")
+            description = st.text_input("Description", placeholder="e.g., Valdez 5+ Ks, or 3-leg parlay")
+            c1, c2 = st.columns(2)
+            odds_manual = c1.number_input("Odds (American)", value=-110, step=5, key="manual_odds")
+            stake_manual = c2.number_input("Stake ($)", min_value=0.01, value=5.0, step=0.5, key="manual_stake")
+            if st.button("✅ Log this bet", key="log_manual"):
+                from datetime import datetime
+                if not description.strip():
+                    st.error("Add a description so you remember what this bet was.")
+                else:
+                    decimal = american_to_decimal(odds_manual)
+                    log_bet({
+                        "logged_at": datetime.now().isoformat(timespec="seconds"),
+                        "game_date": today, "game_id": "",
+                        "home_team": "", "away_team": "",
+                        "bet_side": "", "bet_team": "",
+                        "pitcher": "", "opp_pitcher": "",
+                        "odds_american": odds_manual, "odds_decimal": round(decimal, 4),
+                        "model_p": "", "market_p": "", "edge": "",
+                        "stake": round(stake_manual, 2),
+                        "source": "manual", "bet_type": "other",
+                        "description": description.strip(),
+                    })
+                    st.success(f"Logged: {description} at {format_american(odds_manual)} for ${stake_manual:.2f}")
+                    st.rerun()
+
     with tab3:
-        st.subheader("Bet tracker performance")
+        st.subheader("📈 Performance")
         df = ensure_log()
         if df.empty:
-            st.info("No bets logged yet. Go to Recommended Bets and click 'Log all'.")
+            st.info("No bets logged yet. Place bets in 'Place a Bet' or log model recs.")
         else:
+            df["source"] = df["source"].fillna("").replace("", "model")
+            view = st.radio("View", ["All", "Model recs only", "My bets only"], horizontal=True)
+            if view == "Model recs only":
+                df = df[df["source"] == "model"]
+            elif view == "My bets only":
+                df = df[df["source"] == "manual"]
+
             finished = df[df["status"].isin(["won", "lost"])].copy()
             pending = df[df["status"] == "pending"]
             c1, c2, c3 = st.columns(3)
-            c1.metric("Bets logged", len(df))
+            c1.metric("Total logged", len(df))
             c2.metric("Pending", len(pending))
             c3.metric("Completed", len(finished))
 
@@ -275,15 +368,29 @@ def main():
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Win rate", f"{wins/len(finished)*100:.1f}%")
                 c2.metric("Wagered", f"${wagered:.0f}")
-                c3.metric("Profit", f"${profit:+.2f}")
+                c3.metric("Profit", f"${profit:+.2f}", delta_color="normal")
                 c4.metric("ROI", f"{roi*100:+.2f}%")
 
+            if not pending.empty:
+                st.subheader("⏳ Pending — manual resolve")
+                st.caption("Auto-resolution works for moneylines via game outcomes. Custom bets (props/parlays) need to be marked here.")
+                from tracker import manual_resolve
+                for idx, row in pending.iterrows():
+                    if row.get("bet_type") == "moneyline" and row.get("game_id"):
+                        continue
+                    desc = row.get("description") or f"{row.get('bet_team')} {row.get('bet_type')}"
+                    cols = st.columns([4, 1, 1, 1])
+                    cols[0].markdown(f"**{desc}** @ {format_american(int(row['odds_american']))} • ${float(row['stake']):.2f}")
+                    if cols[1].button("✅ Won", key=f"w{idx}"):
+                        manual_resolve(idx, True); st.rerun()
+                    if cols[2].button("❌ Lost", key=f"l{idx}"):
+                        manual_resolve(idx, False); st.rerun()
+
+            if not finished.empty:
                 st.subheader("Recent results")
-                display = finished[["game_date", "bet_team", "odds_american", "edge",
-                                    "stake", "status", "profit"]].tail(20)
-                st.dataframe(display, use_container_width=True, hide_index=True)
-            else:
-                st.warning("No bets resolved yet. Run `python tracker.py update` after games conclude.")
+                display_cols = ["game_date", "bet_team", "description", "odds_american", "stake", "source", "status", "profit"]
+                available_cols = [c for c in display_cols if c in finished.columns]
+                st.dataframe(finished[available_cols].tail(30), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

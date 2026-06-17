@@ -24,13 +24,30 @@ COLUMNS = [
     "odds_american", "odds_decimal",
     "model_p", "market_p", "edge", "stake",
     "status", "actual_winner", "profit",
+    "source", "bet_type", "description",
 ]
 
 
 def ensure_log() -> pd.DataFrame:
     if not LOG_FILE.exists():
         pd.DataFrame(columns=COLUMNS).to_csv(LOG_FILE, index=False)
-    return pd.read_csv(LOG_FILE)
+    df = pd.read_csv(LOG_FILE)
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col in ("source", "bet_type", "description") else None
+    return df
+
+
+def manual_resolve(idx: int, won: bool) -> None:
+    """Mark a manual bet as won/lost (for props that can't auto-resolve)."""
+    df = ensure_log()
+    row = df.iloc[idx]
+    stake = float(row["stake"])
+    decimal = float(row["odds_decimal"])
+    profit = stake * (decimal - 1) if won else -stake
+    df.at[idx, "status"] = "won" if won else "lost"
+    df.at[idx, "profit"] = round(profit, 2)
+    df.to_csv(LOG_FILE, index=False)
 
 
 def log_bet(row: dict) -> None:
@@ -56,9 +73,18 @@ def update_pending() -> None:
     pending = df[df["status"] == "pending"]
     print(f"Checking {len(pending)} pending bets...")
     updated = 0
+    skipped_manual = 0
     for idx, row in pending.iterrows():
+        gid = row.get("game_id")
+        if not gid or pd.isna(gid) or str(gid).strip() == "":
+            skipped_manual += 1
+            continue
+        bet_type = str(row.get("bet_type") or "moneyline").lower()
+        if bet_type not in ("moneyline", ""):
+            skipped_manual += 1
+            continue
         try:
-            games = statsapi.schedule(game_id=int(row["game_id"]))
+            games = statsapi.schedule(game_id=int(gid))
             if not games:
                 continue
             g = games[0]
@@ -76,7 +102,7 @@ def update_pending() -> None:
         except Exception as e:
             print(f"  Error checking game {row['game_id']}: {e}")
     df.to_csv(LOG_FILE, index=False)
-    print(f"Updated {updated} bets.")
+    print(f"Updated {updated} bets. ({skipped_manual} manual bets skipped — resolve them in dashboard.)")
 
 
 def summary() -> None:

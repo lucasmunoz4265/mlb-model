@@ -244,6 +244,9 @@ def main(edge_threshold=0.05, bankroll=500.0, kelly_frac=0.05) -> None:
             "market_p": round(market_p_bet, 4),
             "edge": round(edge_val, 4),
             "stake": round(stake, 2),
+            "source": "model",
+            "bet_type": "moneyline",
+            "description": "",
         })
 
     print(f"\n  ✓ Logged {len(recs)} recommendations to data/bet_log.csv")
