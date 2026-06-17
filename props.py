@@ -57,6 +57,13 @@ AB_BOUNDS = (3.0, 4.6)
 OPP_ADJ_BOUNDS = (0.85, 1.15)
 P_HIT_BOUNDS = (0.05, 0.60)
 
+# Calibration corrections — empirically derived from backtest_props.py over two
+# out-of-sample season pairs (2023→24 and 2024→25), which both showed the raw
+# model leaning ~3-6% toward the OVER (it over-projects). These shrink the
+# projection to re-center calibration. Re-run backtest_props.py if inputs change.
+PITCHER_K_CALIBRATION = 0.95   # raw K projection ran ~0.25 K high
+BATTER_HIT_CALIBRATION = 0.90  # raw hit rate over-projected P(1+ hit) by ~6%
+
 
 # --------------------------------------------------------------------------- #
 # Poisson helpers (no scipy dependency)                                        #
@@ -192,7 +199,7 @@ def get_team_k_adjustments(season: int) -> dict:
 def expected_strikeouts(profile: dict, opp_adj: float) -> float:
     k9 = profile["k_per_9"]
     ip = max(IP_BOUNDS[0], min(IP_BOUNDS[1], profile["ip_per_start"]))
-    return (k9 / 9.0) * ip * opp_adj
+    return (k9 / 9.0) * ip * opp_adj * PITCHER_K_CALIBRATION
 
 
 # --------------------------------------------------------------------------- #
@@ -465,7 +472,7 @@ def model_batter_props(events_odds: dict, season: int,
                 baa = get_pitcher_baa(opp_pitcher, season)
                 if baa:
                     opp_adj = _clamp(baa / LEAGUE_BAA, *OPP_ADJ_BOUNDS)
-            p_hit = _clamp(prof["avg"] * opp_adj, *P_HIT_BOUNDS)
+            p_hit = _clamp(prof["avg"] * opp_adj * BATTER_HIT_CALIBRATION, *P_HIT_BOUNDS)
             n = max(1, round(_clamp(prof["ab_per_game"], *AB_BOUNDS)))
             p_over = binom_over_prob(line["point"], n, p_hit)
             p_under = 1.0 - p_over
