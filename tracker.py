@@ -6,6 +6,7 @@ Usage:
   python tracker.py recent    Show the last 20 bets logged
 """
 
+import re
 import sys
 import warnings
 warnings.filterwarnings("ignore")
@@ -14,6 +15,54 @@ import pandas as pd
 import statsapi
 
 from db import read_all, insert_or_update, update_bet, is_supabase_active
+
+# Matches descriptions our prop logger writes, e.g. "Framber Valdez Over 5.5 Ks".
+PROP_DESC_RE = re.compile(r"^(?P<pitcher>.+?)\s+(?P<side>Over|Under)\s+(?P<line>[\d.]+)\s+Ks",
+                          re.IGNORECASE)
+
+
+def _boxscore_strikeouts(game_id, pitcher_name: str):
+    """Return a pitcher's strikeouts from a final game's boxscore, or None."""
+    data = statsapi.boxscore_data(int(float(game_id)))
+    target = pitcher_name.strip().lower()
+    for side in ("home", "away"):
+        players = data.get(side, {}).get("players", {})
+        for p in players.values():
+            person = p.get("person", {})
+            if person.get("fullName", "").strip().lower() == target:
+                pitching = p.get("stats", {}).get("pitching", {})
+                if "strikeOuts" in pitching:
+                    return int(pitching["strikeOuts"])
+    return None
+
+
+def _resolve_strikeout_prop(bet_id, row) -> bool:
+    """Resolve a pitcher-strikeout prop from the final boxscore. Returns True if resolved."""
+    m = PROP_DESC_RE.match(str(row.get("description") or ""))
+    if not m:
+        return False
+    gid = row.get("game_id")
+    if not gid or pd.isna(gid) or str(gid).strip() == "":
+        return False
+    games = statsapi.schedule(game_id=int(float(gid)))
+    if not games or games[0]["status"] != "Final":
+        return False
+    ks = _boxscore_strikeouts(gid, m.group("pitcher"))
+    if ks is None:
+        return False
+    line = float(m.group("line"))
+    went_over = ks > line
+    bet_won = (m.group("side").lower() == "over" and went_over) or \
+              (m.group("side").lower() == "under" and not went_over)
+    stake = float(row["stake"]) if pd.notna(row["stake"]) else 0
+    decimal = float(row["odds_decimal"]) if pd.notna(row["odds_decimal"]) else 0
+    profit = stake * (decimal - 1) if bet_won else -stake
+    update_bet(bet_id, {
+        "status": "won" if bet_won else "lost",
+        "actual_winner": f"{m.group('pitcher')}: {ks} K",
+        "profit": round(profit, 2),
+    })
+    return True
 
 
 def ensure_log() -> pd.DataFrame:
@@ -50,6 +99,15 @@ def update_pending() -> None:
             skipped_manual += 1
             continue
         bet_type = str(row.get("bet_type") or "moneyline").lower()
+        if bet_type == "prop":
+            try:
+                if _resolve_strikeout_prop(bet_id, row):
+                    updated += 1
+                else:
+                    skipped_manual += 1
+            except Exception as e:
+                print(f"  Error resolving prop {bet_id}: {e}")
+            continue
         if bet_type not in ("moneyline", ""):
             skipped_manual += 1
             continue

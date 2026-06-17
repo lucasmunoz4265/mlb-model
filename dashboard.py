@@ -232,7 +232,8 @@ def main():
     rows = [r for r in rows if abs(r.get("edge_home", 0) or 0) < 0.50 and abs(r.get("edge_away", 0) or 0) < 0.50]
     rows.sort(key=lambda r: max(r["edge_home"], r["edge_away"]), reverse=True)
 
-    tab1, tab2, tab_bet, tab3 = st.tabs(["🎯 Recommended Bets", "📋 Full Slate", "📝 Place a Bet", "📈 Performance"])
+    tab1, tab2, tab_props, tab_bet, tab3 = st.tabs(
+        ["🎯 Recommended Bets", "📋 Full Slate", "⚾ Player Props", "📝 Place a Bet", "📈 Performance"])
 
     with tab1:
         recs = []
@@ -300,6 +301,102 @@ def main():
                 "Edge Away": f"{r['edge_away']*100:+.1f}%",
             } for r in rows])
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    with tab_props:
+        st.subheader("⚾ Pitcher Strikeout Props")
+        st.caption("Each starter's strikeouts modeled as Poisson(expected K), compared to "
+                   "FanDuel's line. Fetching props from The Odds API costs **~1 credit per game**.")
+        from props import (load_cached_props, fetch_props_cached, model_props,
+                           build_pitcher_opponent_map)
+        season = date.today().year
+        gid_by_pair = {(normalize(g["home_name"]), normalize(g["away_name"])): g
+                       for g in games}
+        opponent_map = build_pitcher_opponent_map(games)
+        cached = load_cached_props(today)
+
+        pc1, pc2, pc3 = st.columns([2, 2, 3])
+        max_g = max(len(games), 1)
+        limit = pc1.number_input("Games to fetch", 1, max_g, max_g, step=1,
+                                 help="Each game ≈ 1 credit. Lower this to spend less.")
+        fetch_clicked = pc2.button(f"💸 Fetch props (~{int(limit)} credits)")
+        if cached:
+            pc3.caption(f"📦 Cache: {len(cached['events'])} games for {today} — viewing is free")
+
+        if fetch_clicked:
+            with st.spinner("Fetching props + modeling..."):
+                payload = fetch_props_cached(api_key, today, limit=int(limit))
+                st.session_state["prop_rows"] = model_props(payload["events"], season, opponent_map)
+                st.session_state["prop_remaining"] = payload.get("remaining")
+        elif cached and "prop_rows" not in st.session_state:
+            with st.spinner("Modeling cached props..."):
+                st.session_state["prop_rows"] = model_props(cached["events"], season, opponent_map)
+
+        prop_rows = st.session_state.get("prop_rows")
+        if st.session_state.get("prop_remaining"):
+            st.caption(f"Odds API credits remaining: **{st.session_state['prop_remaining']}**")
+
+        if not prop_rows:
+            st.info("No props loaded yet. Click **Fetch props** to pull tonight's lines "
+                    "(uses credits), or no cache exists for today.")
+        else:
+            prop_rows = sorted(prop_rows,
+                               key=lambda r: max(r["edge_over"], r["edge_under"]), reverse=True)
+            flagged = [(r, side, p, odds, dec, edge)
+                       for r in prop_rows
+                       for side, p, odds, dec, edge in [
+                           ("Over", r["p_over"], r["over_odds"], r["over_dec"], r["edge_over"]),
+                           ("Under", r["p_under"], r["under_odds"], r["under_dec"], r["edge_under"])]
+                       if edge >= edge_threshold]
+            st.markdown(f"**{len(flagged)} props at edge ≥ {edge_threshold:.0%}**")
+            for r, side, p, odds, dec, edge in flagged:
+                with st.container(border=True):
+                    cols = st.columns([3, 1, 1, 1, 1])
+                    cols[0].markdown(
+                        f"**{r['pitcher']} {side} {r['line']} Ks at {format_american(odds)}**  \n"
+                        f"_{r['away']} @ {r['home']}_  \n"
+                        f"<small>proj {r['lambda']:.2f} K • K/9 {r['k_per_9']:.1f} • {r['source']}</small>",
+                        unsafe_allow_html=True)
+                    cols[1].metric("Model", f"{p*100:.0f}%")
+                    cols[2].metric("Line", f"{r['line']:g}")
+                    cols[3].metric("Edge", f"{edge*100:+.1f}%")
+                    stake = kelly_stake(p, dec, bankroll, kelly_frac)
+                    cols[4].metric("Stake", f"${stake:.2f}")
+                    if log_enabled:
+                        if cols[4].button("Log bet", key=f"prop_{r['pitcher']}_{side}"):
+                            from datetime import datetime
+                            g = gid_by_pair.get((r["home"], r["away"]), {})
+                            log_bet({
+                                "logged_at": datetime.now().isoformat(timespec="seconds"),
+                                "game_date": g.get("game_date", today),
+                                "game_id": g.get("game_id", ""),
+                                "home_team": r["home"], "away_team": r["away"],
+                                "bet_side": side.lower(), "bet_team": r["pitcher"],
+                                "pitcher": r["pitcher"], "opp_pitcher": "",
+                                "odds_american": odds, "odds_decimal": round(dec, 4),
+                                "model_p": round(p, 4),
+                                "market_p": round(r["mkt_over"] if side == "Over"
+                                                  else 1 - r["mkt_over"], 4) if r["mkt_over"] else "",
+                                "edge": round(edge, 4), "stake": round(stake, 2),
+                                "source": "model", "bet_type": "prop",
+                                "description": f"{r['pitcher']} {side} {r['line']:g} Ks",
+                            })
+                            st.success(f"Logged: {r['pitcher']} {side} {r['line']:g} Ks")
+            if not flagged:
+                st.info("No props meet the edge threshold. Lower it in the sidebar to see more.")
+
+            with st.expander("📊 Full prop table (all modeled pitchers)"):
+                st.dataframe(pd.DataFrame([{
+                    "Pitcher": r["pitcher"],
+                    "Matchup": f"{r['away']} @ {r['home']}",
+                    "Line": f"{r['line']:g}",
+                    "Proj K": f"{r['lambda']:.2f}",
+                    "K/9": f"{r['k_per_9']:.1f}",
+                    "Over": format_american(r["over_odds"]),
+                    "Under": format_american(r["under_odds"]),
+                    "Edge Over": f"{r['edge_over']*100:+.1f}%",
+                    "Edge Under": f"{r['edge_under']*100:+.1f}%",
+                    "Source": r["source"],
+                } for r in prop_rows]), use_container_width=True, hide_index=True)
 
     with tab_bet:
         st.subheader("📝 Log a bet you placed")
@@ -434,7 +531,7 @@ def main():
                 c4.metric("ROI", f"{roi*100:+.2f}%")
 
             manual_pending = pending[
-                (pending["bet_type"].fillna("").astype(str).str.lower().isin(["other", "prop", "parlay"]))
+                (pending["bet_type"].fillna("").astype(str).str.lower().isin(["other", "parlay"]))
                 | (pending["game_id"].fillna("").astype(str).str.strip() == "")
             ]
             if not manual_pending.empty:
