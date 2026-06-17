@@ -51,6 +51,23 @@ def get_tonight_games():
     return today, statsapi.schedule(start_date=today, end_date=today)
 
 
+@st.cache_data(ttl=300, show_spinner="Checking pending bet results...")
+def auto_update_pending():
+    """Run tracker.update_pending and return (updated_count, timestamp)."""
+    from tracker import update_pending as _update
+    from io import StringIO
+    import sys
+    from datetime import datetime
+    buf = StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        _update()
+    finally:
+        sys.stdout = old
+    return buf.getvalue(), datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
 @st.cache_data(ttl=300, show_spinner="Fetching FanDuel odds...")
 def get_fanduel_odds(api_key):
     if not api_key:
@@ -340,6 +357,15 @@ def main():
 
     with tab3:
         st.subheader("📈 Performance")
+
+        # Auto-resolve pending ML bets on page load (cached 5 min)
+        update_log, last_check = auto_update_pending()
+        c_status, c_btn = st.columns([4, 1])
+        c_status.caption(f"Auto-check ran at **{last_check}** — {update_log.strip()}")
+        if c_btn.button("🔄 Check now"):
+            auto_update_pending.clear()
+            st.rerun()
+
         df = ensure_log()
         if df.empty:
             st.info("No bets logged yet. Place bets in 'Place a Bet' or log model recs.")
