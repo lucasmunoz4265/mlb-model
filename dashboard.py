@@ -560,6 +560,18 @@ def main():
                 c3.metric("Profit", f"${profit:+.2f}", delta_color="normal")
                 c4.metric("ROI", f"{roi*100:+.2f}%")
 
+            clv_series = pd.to_numeric(df.get("clv_pct"), errors="coerce").dropna() \
+                if "clv_pct" in df.columns else pd.Series(dtype=float)
+            if not clv_series.empty:
+                st.markdown("**📉 Closing Line Value (CLV)**")
+                v1, v2, v3 = st.columns(3)
+                v1.metric("Avg CLV", f"{clv_series.mean()*100:+.2f}%")
+                v2.metric("Beat the close", f"{(clv_series > 0).mean()*100:.0f}%",
+                          help=f"{(clv_series > 0).sum()} of {len(clv_series)} bets got a better price than the close")
+                v3.metric("Bets tracked", len(clv_series))
+                st.caption("Positive average CLV over many bets = you're beating the market — the "
+                           "best early sign the model has real edge. Updated automatically 3×/day by the cloud job.")
+
             def bet_label(row):
                 bt = str(row.get("bet_type") or "").lower()
                 desc = str(row.get("description") or "").strip()
@@ -579,6 +591,12 @@ def main():
                     lambda x: f"${x:.2f}" if pd.notna(x) else "—")
                 out["Edge"] = pd.to_numeric(d["edge"], errors="coerce").apply(
                     lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "—")
+                if "close_odds" in d.columns:
+                    out["Close"] = pd.to_numeric(d["close_odds"], errors="coerce").apply(
+                        lambda x: format_american(int(x)) if pd.notna(x) else "—")
+                if "clv_pct" in d.columns:
+                    out["CLV"] = pd.to_numeric(d["clv_pct"], errors="coerce").apply(
+                        lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "—")
                 for c in extra_cols:
                     out[c] = d[c.lower()] if c.lower() in d.columns else "—"
                 return out
