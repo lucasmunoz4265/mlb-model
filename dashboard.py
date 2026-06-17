@@ -45,8 +45,8 @@ def get_current_ratings():
     return team_ratings, pitcher_ratings
 
 
-@st.cache_data(ttl=120, show_spinner="Loading tonight's games...")
 def get_tonight_games():
+    """Not cached — game statuses change throughout the night and we always want fresh."""
     today = date.today().isoformat()
     return today, statsapi.schedule(start_date=today, end_date=today)
 
@@ -190,11 +190,17 @@ def main():
 
     odds_by_pair = {(normalize(o["home_team"]), normalize(o["away_team"])): o for o in odds_data}
 
-    PREGAME_STATUSES = {"Scheduled", "Pre-Game", "Warmup", "Delayed"}
+    NON_PREGAME_KEYWORDS = ("final", "game over", "in progress", "suspended",
+                            "postponed", "cancelled", "completed")
     from datetime import datetime, timezone
 
     def is_pregame(g):
-        # Time check FIRST — clock is always accurate, can't be cached stale.
+        # Check 1: explicit non-pregame status (handles status="In Progress" etc.)
+        status_lower = str(g.get("status") or "").lower()
+        for kw in NON_PREGAME_KEYWORDS:
+            if kw in status_lower:
+                return False
+        # Check 2: scheduled start time in the past
         dt_str = g.get("game_datetime") or ""
         if dt_str:
             try:
@@ -203,9 +209,8 @@ def main():
                     return False
             except Exception:
                 pass
-        # Status check as additional filter for games not yet at scheduled time
-        # but already in some non-pregame state.
-        if g.get("status") not in PREGAME_STATUSES:
+        # Check 3: must affirmatively be in a pregame state if status is set
+        if status_lower and status_lower not in ("scheduled", "pre-game", "warmup", "delayed", ""):
             return False
         return True
 
@@ -222,6 +227,9 @@ def main():
             continue
         rows.append({**pred, **lines})
     rows = compute_edges(rows)
+    # Safety net: edges over 50% are almost certainly stale/live odds, not real pre-game edges.
+    # Real pre-game MLB MLs rarely produce edges over 25%.
+    rows = [r for r in rows if abs(r.get("edge_home", 0) or 0) < 0.50 and abs(r.get("edge_away", 0) or 0) < 0.50]
     rows.sort(key=lambda r: max(r["edge_home"], r["edge_away"]), reverse=True)
 
     tab1, tab2, tab_bet, tab3 = st.tabs(["🎯 Recommended Bets", "📋 Full Slate", "📝 Place a Bet", "📈 Performance"])
