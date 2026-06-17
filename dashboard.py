@@ -190,8 +190,14 @@ def main():
 
     odds_by_pair = {(normalize(o["home_team"]), normalize(o["away_team"])): o for o in odds_data}
 
+    PREGAME_STATUSES = {"Scheduled", "Pre-Game", "Warmup", "Delayed"}
+    pregame_games = [g for g in games if g.get("status") in PREGAME_STATUSES]
+    n_started = len(games) - len(pregame_games)
+    if n_started > 0:
+        st.info(f"⏱️ {n_started} of tonight's {len(games)} games have already started — they're hidden because comparing pre-game model predictions to live in-game odds produces meaningless edges.")
+
     rows = []
-    for g in games:
+    for g in pregame_games:
         pred = predict_game(g, team_ratings, pitcher_ratings)
         lines = fanduel_lines_for_game(pred, odds_by_pair.get((pred["home"], pred["away"])))
         if lines is None:
