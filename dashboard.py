@@ -45,7 +45,7 @@ def get_current_ratings():
     return team_ratings, pitcher_ratings
 
 
-@st.cache_data(ttl=600, show_spinner="Loading tonight's games...")
+@st.cache_data(ttl=120, show_spinner="Loading tonight's games...")
 def get_tonight_games():
     today = date.today().isoformat()
     return today, statsapi.schedule(start_date=today, end_date=today)
@@ -194,9 +194,7 @@ def main():
     from datetime import datetime, timezone
 
     def is_pregame(g):
-        if g.get("status") not in PREGAME_STATUSES:
-            return False
-        # Belt-and-suspenders: also check start time in case cached status is stale
+        # Time check FIRST — clock is always accurate, can't be cached stale.
         dt_str = g.get("game_datetime") or ""
         if dt_str:
             try:
@@ -205,6 +203,10 @@ def main():
                     return False
             except Exception:
                 pass
+        # Status check as additional filter for games not yet at scheduled time
+        # but already in some non-pregame state.
+        if g.get("status") not in PREGAME_STATUSES:
+            return False
         return True
 
     pregame_games = [g for g in games if is_pregame(g)]
