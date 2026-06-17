@@ -371,11 +371,15 @@ def main():
             st.info("No bets logged yet. Place bets in 'Place a Bet' or log model recs.")
         else:
             df["source"] = df["source"].fillna("").replace("", "model")
-            view = st.radio("View", ["All", "Model recs only", "My bets only"], horizontal=True)
+            view = st.radio("View", ["My bets only", "Model recs only", "All"], horizontal=True, index=0)
             if view == "Model recs only":
                 df = df[df["source"] == "model"]
             elif view == "My bets only":
                 df = df[df["source"] == "manual"]
+
+            if df.empty:
+                st.info(f"No bets to show in '{view}' yet. Go to 'Place a Bet' to log one.")
+                return
 
             finished = df[df["status"].isin(["won", "lost"])].copy()
             pending = df[df["status"] == "pending"]
@@ -397,14 +401,16 @@ def main():
                 c3.metric("Profit", f"${profit:+.2f}", delta_color="normal")
                 c4.metric("ROI", f"{roi*100:+.2f}%")
 
-            if not pending.empty:
+            manual_pending = pending[
+                (pending["bet_type"].fillna("").astype(str).str.lower().isin(["other", "prop", "parlay"]))
+                | (pending["game_id"].fillna("").astype(str).str.strip() == "")
+            ]
+            if not manual_pending.empty:
                 st.subheader("⏳ Pending — manual resolve")
                 st.caption("Auto-resolution works for moneylines via game outcomes. Custom bets (props/parlays) need to be marked here.")
                 from tracker import manual_resolve
-                for idx, row in pending.iterrows():
-                    if row.get("bet_type") == "moneyline" and row.get("game_id"):
-                        continue
-                    desc = row.get("description") or f"{row.get('bet_team')} {row.get('bet_type')}"
+                for idx, row in manual_pending.iterrows():
+                    desc = row.get("description") or f"{row.get('bet_team')}"
                     cols = st.columns([4, 1, 1, 1])
                     cols[0].markdown(f"**{desc}** @ {format_american(int(row['odds_american']))} • ${float(row['stake']):.2f}")
                     if cols[1].button("✅ Won", key=f"w{idx}"):
