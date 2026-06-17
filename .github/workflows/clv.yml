@@ -1,0 +1,27 @@
+name: CLV capture
+
+# Captures FanDuel closing moneylines for pending bets and records CLV to Supabase.
+# Runs a few times across the day so the LAST pre-game capture before each game
+# locks in as that game's closing line. Each run = 1 Odds API credit.
+
+on:
+  schedule:
+    - cron: "30 16 * * *"   # ~12:30 ET — before early afternoon games
+    - cron: "30 22 * * *"   # ~18:30 ET — before the evening slate
+    - cron: "45 1 * * *"    # ~21:45 ET — before late west-coast games
+  workflow_dispatch: {}      # allow manual runs from the Actions tab
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python clv.py
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
