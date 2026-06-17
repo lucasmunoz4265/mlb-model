@@ -8,7 +8,8 @@ import pandas as pd
 DATA = Path(__file__).parent / "data"
 LOG_FILE = DATA / "bet_log.csv"
 
-NUMERIC_FIELDS = ("odds_american", "odds_decimal", "model_p", "market_p", "edge", "stake", "profit")
+NUMERIC_FIELDS = ("odds_american", "odds_decimal", "model_p", "market_p", "edge", "stake",
+                  "profit", "close_odds", "close_decimal", "clv_pct")
 COLUMNS = [
     "logged_at", "game_date", "game_id", "home_team", "away_team",
     "bet_side", "bet_team", "pitcher", "opp_pitcher",
@@ -16,6 +17,7 @@ COLUMNS = [
     "model_p", "market_p", "edge", "stake",
     "status", "actual_winner", "profit",
     "source", "bet_type", "description",
+    "close_odds", "close_decimal", "clv_pct", "clv_at",
 ]
 
 
