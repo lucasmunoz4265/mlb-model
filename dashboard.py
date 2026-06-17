@@ -191,7 +191,23 @@ def main():
     odds_by_pair = {(normalize(o["home_team"]), normalize(o["away_team"])): o for o in odds_data}
 
     PREGAME_STATUSES = {"Scheduled", "Pre-Game", "Warmup", "Delayed"}
-    pregame_games = [g for g in games if g.get("status") in PREGAME_STATUSES]
+    from datetime import datetime, timezone
+
+    def is_pregame(g):
+        if g.get("status") not in PREGAME_STATUSES:
+            return False
+        # Belt-and-suspenders: also check start time in case cached status is stale
+        dt_str = g.get("game_datetime") or ""
+        if dt_str:
+            try:
+                game_dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                if game_dt < datetime.now(timezone.utc):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    pregame_games = [g for g in games if is_pregame(g)]
     n_started = len(games) - len(pregame_games)
     if n_started > 0:
         st.info(f"⏱️ {n_started} of tonight's {len(games)} games have already started — they're hidden because comparing pre-game model predictions to live in-game odds produces meaningless edges.")
