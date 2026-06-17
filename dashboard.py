@@ -16,7 +16,7 @@ from pitcher_elo import (
 )
 from odds import american_to_prob, american_to_decimal
 from tonight import normalize, format_american
-from tracker import log_bet, LOG_FILE, ensure_log
+from tracker import log_bet, ensure_log
 
 DATA = Path(__file__).parent / "data"
 
