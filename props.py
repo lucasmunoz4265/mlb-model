@@ -42,9 +42,20 @@ from odds import american_to_prob, american_to_decimal
 
 DATA = Path(__file__).parent / "data"
 
-PROP_MARKET = "pitcher_strikeouts"
+PITCHER_K_MARKET = "pitcher_strikeouts"
+BATTER_HITS_MARKET = "batter_hits"
+DEFAULT_MARKETS = [PITCHER_K_MARKET, BATTER_HITS_MARKET]
+
+# Pitcher-K model
 DEFAULT_IP_PER_START = 5.4   # league-typical modern starter when we lack data
 IP_BOUNDS = (3.5, 7.0)
+
+# Batter-hits model
+LEAGUE_BAA = 0.245           # league avg batting-average-against, for opp-pitcher scaling
+DEFAULT_AB_PER_GAME = 3.9
+AB_BOUNDS = (3.0, 4.6)
+OPP_ADJ_BOUNDS = (0.85, 1.15)
+P_HIT_BOUNDS = (0.05, 0.60)
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +74,21 @@ def over_prob(point: float, lam: float) -> float:
     """P(strikeouts beats the line). For a half-point line (e.g. 5.5),
     'Over' means X >= 6, i.e. 1 - P(X <= 5) = 1 - cdf(floor(point))."""
     return max(0.0, min(1.0, 1.0 - poisson_cdf(math.floor(point), lam)))
+
+
+# --------------------------------------------------------------------------- #
+# Binomial helpers — for batter hits (fixed small number of at-bats)           #
+# --------------------------------------------------------------------------- #
+def binom_pmf(k: int, n: int, p: float) -> float:
+    return math.comb(n, k) * p ** k * (1 - p) ** (n - k)
+
+
+def binom_over_prob(point: float, n: int, p: float) -> float:
+    """P(count beats the line) for Binomial(n, p). 'Over 0.5' = P(X >= 1)."""
+    k = math.floor(point) + 1
+    if k > n:
+        return 0.0
+    return max(0.0, min(1.0, sum(binom_pmf(i, n, p) for i in range(k, n + 1))))
 
 
 # --------------------------------------------------------------------------- #
@@ -182,11 +208,12 @@ def fetch_events(api_key: str) -> list:
     return r.json()
 
 
-def fetch_event_props(api_key: str, event_id: str) -> tuple:
-    """Fetch FanDuel pitcher-strikeout props for one event. Costs ~1 credit."""
+def fetch_event_props(api_key: str, event_id: str, markets: list | None = None) -> tuple:
+    """Fetch FanDuel props for one event. Costs (len(markets)) credits."""
+    markets = markets or [PITCHER_K_MARKET]
     r = requests.get(
         f"{BASE}/events/{event_id}/odds",
-        params={"apiKey": api_key, "regions": "us", "markets": PROP_MARKET,
+        params={"apiKey": api_key, "regions": "us", "markets": ",".join(markets),
                 "bookmakers": "fanduel", "oddsFormat": "american"},
         timeout=15,
     )
@@ -212,25 +239,34 @@ def save_cached_props(day: str, payload: dict) -> None:
     cache_path(day).write_text(json.dumps(payload, indent=2))
 
 
-def fetch_props_cached(api_key: str, day: str, limit: int | None = None,
-                       force: bool = False) -> dict:
+def fetch_props_cached(api_key: str, day: str, markets: list | None = None,
+                       limit: int | None = None, force: bool = False) -> dict:
     """Return {event_id: event_odds_json} for the day, fetching only what's
-    missing from cache. Set force=True to refetch everything (spends credits)."""
-    cached = (None if force else load_cached_props(day)) or {"events": {}, "remaining": None}
+    missing from cache. If new markets are requested that the cache doesn't have,
+    events are refetched so the cache holds all requested markets.
+    Set force=True to refetch everything (spends credits)."""
+    markets = markets or [PITCHER_K_MARKET]
+    cached = (None if force else load_cached_props(day)) or \
+        {"events": {}, "remaining": None, "markets": []}
+    # If the cache lacks any requested market, its event payloads are stale → refetch.
+    need_new_markets = not set(markets).issubset(set(cached.get("markets") or []))
+    do_force = force or need_new_markets
     events = fetch_events(api_key)
     if limit:
         events = events[:limit]
     remaining = cached.get("remaining")
     for ev in events:
         eid = ev["id"]
-        if eid in cached["events"] and not force:
+        if eid in cached["events"] and not do_force:
             continue
         try:
-            data, remaining = fetch_event_props(api_key, eid)
+            data, remaining = fetch_event_props(api_key, eid, markets)
             cached["events"][eid] = data
         except Exception as e:
             print(f"  prop fetch failed for {ev.get('home_team')} vs {ev.get('away_team')}: {e}")
     cached["remaining"] = remaining
+    cached["markets"] = list(markets) if do_force else \
+        sorted(set(cached.get("markets") or []) | set(markets))
     save_cached_props(day, cached)
     return cached
 
@@ -238,19 +274,20 @@ def fetch_props_cached(api_key: str, day: str, limit: int | None = None,
 # --------------------------------------------------------------------------- #
 # Parse prop odds -> per-pitcher lines                                         #
 # --------------------------------------------------------------------------- #
-def extract_pitcher_lines(event_odds: dict) -> dict:
-    """From one event's odds JSON, return {pitcher_name: {point, over, under}}."""
+def extract_lines(event_odds: dict, market_key: str) -> dict:
+    """From one event's odds JSON, return {player_name: {point, over, under}}
+    for the given prop market (player name comes from the outcome 'description')."""
     out = {}
     for b in event_odds.get("bookmakers", []):
         if b["key"] != "fanduel":
             continue
         for m in b.get("markets", []):
-            if m["key"] != PROP_MARKET:
+            if m["key"] != market_key:
                 continue
             for o in m["outcomes"]:
-                pitcher = o.get("description") or ""
-                entry = out.setdefault(pitcher, {"point": o.get("point"),
-                                                 "over": None, "under": None})
+                player = o.get("description") or ""
+                entry = out.setdefault(player, {"point": o.get("point"),
+                                                "over": None, "under": None})
                 if o["name"].lower() == "over":
                     entry["over"] = o["price"]
                     entry["point"] = o.get("point")
@@ -286,7 +323,7 @@ def model_props(events_odds: dict, season: int, opponent_map: dict | None = None
     for event_odds in events_odds.values():
         home = normalize(event_odds.get("home_team", ""))
         away = normalize(event_odds.get("away_team", ""))
-        lines = extract_pitcher_lines(event_odds)
+        lines = extract_lines(event_odds, PITCHER_K_MARKET)
         for pitcher, line in lines.items():
             if line["point"] is None or line["over"] is None or line["under"] is None:
                 continue
@@ -325,21 +362,168 @@ def model_props(events_odds: dict, season: int, opponent_map: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
+# Batter hits: profile, opponent pitcher, model                                #
+# --------------------------------------------------------------------------- #
+def get_batter_profile(name: str, season: int) -> dict | None:
+    """Current-season AVG, at-bats/game, SLG, and team for a hitter via statsapi.
+    Returns None if the player has too small a sample (props need regulars)."""
+    if not name:
+        return None
+    try:
+        matches = statsapi.lookup_player(name)
+        if not matches:
+            return None
+        pid = matches[0]["id"]
+        data = statsapi.player_stat_data(pid, group="hitting", type="season", season=season)
+        splits = data.get("stats") or []
+        if not splits:
+            return None
+        s = splits[0].get("stats", {})
+        ab = float(s.get("atBats") or 0)
+        g = float(s.get("gamesPlayed") or 0)
+        avg = s.get("avg")
+        avg = float(avg) if avg not in (None, "", ".---") else None
+        if not avg or ab < 20:        # need a real sample to trust the rate
+            return None
+        slg = s.get("slg")
+        slg = float(slg) if slg not in (None, "", ".---") else avg
+        ab_per_game = ab / g if g > 0 else DEFAULT_AB_PER_GAME
+        return {"avg": avg, "ab_per_game": ab_per_game, "slg": slg,
+                "team": normalize(data.get("current_team") or ""),
+                "source": f"statsapi {season}"}
+    except Exception:
+        return None
+
+
+_pitcher_baa_cache: dict = {}
+
+
+def get_pitcher_baa(name: str, season: int) -> float | None:
+    """Opposing starter's batting-average-against (statsapi 'avg'). Cached."""
+    if not name:
+        return None
+    if name in _pitcher_baa_cache:
+        return _pitcher_baa_cache[name]
+    baa = None
+    try:
+        matches = statsapi.lookup_player(name)
+        if matches:
+            data = statsapi.player_stat_data(matches[0]["id"], group="pitching",
+                                             type="season", season=season)
+            splits = data.get("stats") or []
+            if splits:
+                s = splits[0].get("stats", {})
+                ip = _parse_ip(s.get("inningsPitched") or 0)
+                v = s.get("avg")
+                if v not in (None, "", ".---") and ip >= 10:
+                    baa = float(v)
+    except Exception:
+        baa = None
+    _pitcher_baa_cache[name] = baa
+    return baa
+
+
+def build_team_opponent_pitcher_map(games) -> dict:
+    """From a statsapi schedule, map each team -> the opposing probable pitcher
+    they face (home lineup faces the away starter, and vice versa)."""
+    out = {}
+    for g in games:
+        home, away = normalize(g["home_name"]), normalize(g["away_name"])
+        hp = (g.get("home_probable_pitcher") or "").strip()
+        ap = (g.get("away_probable_pitcher") or "").strip()
+        if ap:
+            out[home] = ap   # home batters face the away starter
+        if hp:
+            out[away] = hp
+    return out
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def model_batter_props(events_odds: dict, season: int,
+                       team_opp_pitcher: dict | None = None) -> list:
+    """Model batter HITS as Binomial(at-bats, per-AB hit prob), where the hit
+    prob is the batter's AVG scaled by the opposing starter's BAA vs league.
+    team_opp_pitcher (team -> opposing starter) sharpens the adjustment."""
+    team_opp_pitcher = team_opp_pitcher or {}
+    rows = []
+    for event_odds in events_odds.values():
+        home = normalize(event_odds.get("home_team", ""))
+        away = normalize(event_odds.get("away_team", ""))
+        lines = extract_lines(event_odds, BATTER_HITS_MARKET)
+        for batter, line in lines.items():
+            if line["point"] is None or line["over"] is None or line["under"] is None:
+                continue
+            prof = get_batter_profile(batter, season)
+            if not prof:
+                continue
+            opp_pitcher = team_opp_pitcher.get(prof["team"])
+            opp_adj = 1.0
+            if opp_pitcher:
+                baa = get_pitcher_baa(opp_pitcher, season)
+                if baa:
+                    opp_adj = _clamp(baa / LEAGUE_BAA, *OPP_ADJ_BOUNDS)
+            p_hit = _clamp(prof["avg"] * opp_adj, *P_HIT_BOUNDS)
+            n = max(1, round(_clamp(prof["ab_per_game"], *AB_BOUNDS)))
+            p_over = binom_over_prob(line["point"], n, p_hit)
+            p_under = 1.0 - p_over
+            over_dec = american_to_decimal(line["over"])
+            under_dec = american_to_decimal(line["under"])
+            io, iu = american_to_prob(line["over"]), american_to_prob(line["under"])
+            rows.append({
+                "batter": batter, "home": home, "away": away,
+                "line": line["point"], "team": prof["team"],
+                "avg": prof["avg"], "ab_per_game": prof["ab_per_game"],
+                "p_hit": p_hit, "n_ab": n, "opp_pitcher": opp_pitcher or "—",
+                "opp_adj": opp_adj, "source": prof["source"],
+                "over_odds": line["over"], "under_odds": line["under"],
+                "over_dec": over_dec, "under_dec": under_dec,
+                "p_over": p_over, "p_under": p_under,
+                "mkt_over": io / (io + iu) if (io + iu) else None,
+                "edge_over": p_over * over_dec - 1,
+                "edge_under": p_under * under_dec - 1,
+            })
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
+def _flag_ev(rows, edge):
+    """Return (row, side, p, odds, edge) tuples that meet the edge threshold."""
+    out = []
+    for r in rows:
+        for side, p, odds, e in [
+            ("Over", r["p_over"], r["over_odds"], r["edge_over"]),
+            ("Under", r["p_under"], r["under_odds"], r["edge_under"]),
+        ]:
+            if e >= edge:
+                out.append((r, side, p, odds, e))
+    return out
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Model tonight's pitcher strikeout props.")
+    ap = argparse.ArgumentParser(description="Model tonight's MLB player props (pitcher Ks + batter hits).")
     ap.add_argument("--limit", type=int, default=None,
                     help="only fetch the first N games (testing — saves credits)")
     ap.add_argument("--cached", action="store_true",
                     help="use today's cache only, make no API call (0 credits)")
     ap.add_argument("--force", action="store_true",
                     help="refetch all games even if cached (spends credits)")
+    ap.add_argument("--ks-only", action="store_true", help="pitcher strikeouts only (1 credit/game)")
+    ap.add_argument("--hits-only", action="store_true", help="batter hits only (1 credit/game)")
     ap.add_argument("--edge", type=float, default=0.05, help="min edge to flag")
     args = ap.parse_args()
 
     today = date.today().isoformat()
     season = date.today().year
+    markets = DEFAULT_MARKETS
+    if args.ks_only:
+        markets = [PITCHER_K_MARKET]
+    elif args.hits_only:
+        markets = [BATTER_HITS_MARKET]
 
     if args.cached:
         payload = load_cached_props(today)
@@ -350,45 +534,48 @@ def main():
     else:
         api_key = load_key()
         n = f"first {args.limit} game(s)" if args.limit else "all games"
-        print(f"Fetching pitcher_strikeouts props for {n} "
-              f"(~1 credit/game, FanDuel)...")
-        payload = fetch_props_cached(api_key, today, limit=args.limit, force=args.force)
+        per_game = len(markets)
+        print(f"Fetching {','.join(markets)} for {n} (~{per_game} credit(s)/game, FanDuel)...")
+        payload = fetch_props_cached(api_key, today, markets=markets,
+                                     limit=args.limit, force=args.force)
         print(f"  Odds API credits remaining: {payload.get('remaining')}")
 
-    opponent_map = build_pitcher_opponent_map(statsapi.schedule(start_date=today, end_date=today))
-    rows = model_props(payload["events"], season, opponent_map)
-    if not rows:
-        print("No modelable pitcher props found (need probable pitchers with stats + posted lines).")
-        return
+    schedule = statsapi.schedule(start_date=today, end_date=today)
 
-    rows.sort(key=lambda r: max(r["edge_over"], r["edge_under"]), reverse=True)
-    print("\n" + "=" * 100)
-    print(f"{'Pitcher':<22} {'Matchup':<24} {'Line':>5} {'Proj':>6} "
-          f"{'Over':>7} {'Under':>7} {'EdgeO':>7} {'EdgeU':>7}")
-    print("-" * 100)
-    for r in rows:
-        matchup = f"{r['away'][:10]} @ {r['home'][:10]}"
-        print(f"{r['pitcher'][:22]:<22} {matchup:<24} {r['line']:>5.1f} "
-              f"{r['lambda']:>6.2f} {format_american(r['over_odds']):>7} "
-              f"{format_american(r['under_odds']):>7} "
-              f"{r['edge_over']*100:>+6.1f}% {r['edge_under']*100:>+6.1f}%")
+    if PITCHER_K_MARKET in markets:
+        rows = model_props(payload["events"], season, build_pitcher_opponent_map(schedule))
+        rows.sort(key=lambda r: max(r["edge_over"], r["edge_under"]), reverse=True)
+        print("\n" + "=" * 92 + "\nPITCHER STRIKEOUTS\n" + "-" * 92)
+        for r in rows:
+            print(f"  {r['pitcher'][:22]:<22} {r['away'][:9]+' @ '+r['home'][:9]:<24} "
+                  f"line {r['line']:<4.1f} proj {r['lambda']:>5.2f}  "
+                  f"O {format_american(r['over_odds']):>6} {r['edge_over']*100:>+6.1f}%  "
+                  f"U {format_american(r['under_odds']):>6} {r['edge_under']*100:>+6.1f}%")
+        print(f"\n  +EV (edge >= {args.edge*100:.0f}%):")
+        flagged = _flag_ev(rows, args.edge)
+        for r, side, p, odds, e in flagged or []:
+            print(f"    {r['pitcher']} {side} {r['line']:g} Ks at {format_american(odds)} "
+                  f"(proj {r['lambda']:.2f} | {p*100:.0f}% | {e*100:+.1f}%)")
+        if not flagged:
+            print("    none")
 
-    print("\n" + "=" * 100)
-    print(f"+EV PROPS (edge >= {args.edge*100:.0f}%)")
-    print("-" * 100)
-    flagged = []
-    for r in rows:
-        for side, p, dec, odds, edge in [
-            ("Over", r["p_over"], r["over_dec"], r["over_odds"], r["edge_over"]),
-            ("Under", r["p_under"], r["under_dec"], r["under_odds"], r["edge_under"]),
-        ]:
-            if edge >= args.edge:
-                flagged.append((r, side, p, odds, edge))
-    if not flagged:
-        print("  None tonight at this threshold.")
-    for r, side, p, odds, edge in flagged:
-        print(f"  {r['pitcher']} {side} {r['line']} Ks at {format_american(odds)}  "
-              f"(proj {r['lambda']:.2f} | model {p*100:.0f}% | edge {edge*100:+.1f}% | {r['source']})")
+    if BATTER_HITS_MARKET in markets:
+        brows = model_batter_props(payload["events"], season,
+                                   build_team_opponent_pitcher_map(schedule))
+        brows.sort(key=lambda r: max(r["edge_over"], r["edge_under"]), reverse=True)
+        print("\n" + "=" * 92 + "\nBATTER HITS\n" + "-" * 92)
+        for r in brows:
+            print(f"  {r['batter'][:22]:<22} {r['away'][:9]+' @ '+r['home'][:9]:<24} "
+                  f"line {r['line']:<4.1f} p_hit {r['p_hit']:.3f} x{r['n_ab']}  "
+                  f"O {format_american(r['over_odds']):>6} {r['edge_over']*100:>+6.1f}%  "
+                  f"U {format_american(r['under_odds']):>6} {r['edge_under']*100:>+6.1f}%")
+        print(f"\n  +EV (edge >= {args.edge*100:.0f}%):")
+        flagged = _flag_ev([{**r, "pitcher": r["batter"]} for r in brows], args.edge)
+        for r, side, p, odds, e in flagged or []:
+            print(f"    {r['batter']} {side} {r['line']:g} Hits at {format_american(odds)} "
+                  f"(p_hit {r['p_hit']:.3f} | {p*100:.0f}% | {e*100:+.1f}% | vs {r['opp_pitcher']})")
+        if not flagged:
+            print("    none")
 
 
 if __name__ == "__main__":

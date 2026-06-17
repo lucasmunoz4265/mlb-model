@@ -16,42 +16,50 @@ import statsapi
 
 from db import read_all, insert_or_update, update_bet, is_supabase_active
 
-# Matches descriptions our prop logger writes, e.g. "Framber Valdez Over 5.5 Ks".
-PROP_DESC_RE = re.compile(r"^(?P<pitcher>.+?)\s+(?P<side>Over|Under)\s+(?P<line>[\d.]+)\s+Ks",
-                          re.IGNORECASE)
+# Matches descriptions our prop logger writes, e.g. "Framber Valdez Over 5.5 Ks"
+# or "Aaron Judge Over 1.5 Hits".
+PROP_DESC_RE = re.compile(
+    r"^(?P<player>.+?)\s+(?P<side>Over|Under)\s+(?P<line>[\d.]+)\s+(?P<stat>Ks|Hits)",
+    re.IGNORECASE)
+
+# stat label -> (boxscore group, boxscore field, short label for the result note)
+STAT_BOX = {
+    "ks": ("pitching", "strikeOuts", "K"),
+    "hits": ("batting", "hits", "H"),
+}
 
 
-def _boxscore_strikeouts(game_id, pitcher_name: str):
-    """Return a pitcher's strikeouts from a final game's boxscore, or None."""
+def _boxscore_stat(game_id, player_name: str, group: str, field: str):
+    """Return a player's stat (e.g. pitching strikeOuts, batting hits) from a
+    final game's boxscore, or None if not found."""
     data = statsapi.boxscore_data(int(float(game_id)))
-    target = pitcher_name.strip().lower()
+    target = player_name.strip().lower()
     for side in ("home", "away"):
-        players = data.get(side, {}).get("players", {})
-        for p in players.values():
-            person = p.get("person", {})
-            if person.get("fullName", "").strip().lower() == target:
-                pitching = p.get("stats", {}).get("pitching", {})
-                if "strikeOuts" in pitching:
-                    return int(pitching["strikeOuts"])
+        for p in data.get(side, {}).get("players", {}).values():
+            if p.get("person", {}).get("fullName", "").strip().lower() == target:
+                stat = p.get("stats", {}).get(group, {})
+                if field in stat:
+                    return int(stat[field])
     return None
 
 
-def _resolve_strikeout_prop(bet_id, row) -> bool:
-    """Resolve a pitcher-strikeout prop from the final boxscore. Returns True if resolved."""
+def _resolve_prop(bet_id, row) -> bool:
+    """Resolve a strikeout or hits prop from the final boxscore. Returns True if resolved."""
     m = PROP_DESC_RE.match(str(row.get("description") or ""))
     if not m:
         return False
     gid = row.get("game_id")
     if not gid or pd.isna(gid) or str(gid).strip() == "":
         return False
+    group, field, label = STAT_BOX[m.group("stat").lower()]
     games = statsapi.schedule(game_id=int(float(gid)))
     if not games or games[0]["status"] != "Final":
         return False
-    ks = _boxscore_strikeouts(gid, m.group("pitcher"))
-    if ks is None:
+    actual = _boxscore_stat(gid, m.group("player"), group, field)
+    if actual is None:
         return False
     line = float(m.group("line"))
-    went_over = ks > line
+    went_over = actual > line
     bet_won = (m.group("side").lower() == "over" and went_over) or \
               (m.group("side").lower() == "under" and not went_over)
     stake = float(row["stake"]) if pd.notna(row["stake"]) else 0
@@ -59,7 +67,7 @@ def _resolve_strikeout_prop(bet_id, row) -> bool:
     profit = stake * (decimal - 1) if bet_won else -stake
     update_bet(bet_id, {
         "status": "won" if bet_won else "lost",
-        "actual_winner": f"{m.group('pitcher')}: {ks} K",
+        "actual_winner": f"{m.group('player')}: {actual} {label}",
         "profit": round(profit, 2),
     })
     return True
@@ -101,7 +109,7 @@ def update_pending() -> None:
         bet_type = str(row.get("bet_type") or "moneyline").lower()
         if bet_type == "prop":
             try:
-                if _resolve_strikeout_prop(bet_id, row):
+                if _resolve_prop(bet_id, row):
                     updated += 1
                 else:
                     skipped_manual += 1
