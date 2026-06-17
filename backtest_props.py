@@ -24,6 +24,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -32,7 +33,7 @@ from pathlib import Path
 import pandas as pd
 import statsapi
 
-from props import (over_prob, binom_over_prob, _parse_ip, _clamp,
+from props import (over_prob, binom_over_prob, _parse_ip, _clamp, normalize,
                    AB_BOUNDS, DEFAULT_AB_PER_GAME,
                    PITCHER_K_CALIBRATION, BATTER_HIT_CALIBRATION)
 
@@ -175,6 +176,114 @@ def _report_batters(title, prior, test, n_players, projes, actuals, params):
     return {"bias": bias, "mae": mae, "calib_error": err, "n": n}
 
 
+# --------------------------------------------------------------------------- #
+# Phase 0: game-aware backtest — project each start vs that game's opponent     #
+# --------------------------------------------------------------------------- #
+def team_k_tables(season: int, cache: bool = True) -> dict:
+    """Per-team strikeout rate vs LHP/RHP (and overall) for a season, with the
+    league averages. Cached to disk — opponent K-tendencies drive the handedness
+    adjustment. Every PA is vs an L or R pitcher, so overall = (Lso+Rso)/(Lpa+Rpa)."""
+    path = DATA / f"team_k_by_hand_{season}.json"
+    if cache and path.exists():
+        return json.loads(path.read_text())
+    teams = [t for t in statsapi.get("teams", {"sportId": 1})["teams"]]
+    by_team, tot = {}, {"L": [0.0, 0.0], "R": [0.0, 0.0]}
+    print(f"  building team K-vs-hand table for {season} ({len(teams)} teams)...")
+    for t in teams:
+        rec, so_all, pa_all = {}, 0.0, 0.0
+        for code, hand in (("vl", "L"), ("vr", "R")):
+            try:
+                s = statsapi.get("team_stats", {"teamId": t["id"], "stats": "statSplits",
+                    "sitCodes": code, "group": "hitting", "season": season})["stats"][0]["splits"][0]["stat"]
+                so, pa = float(s["strikeOuts"]), float(s["plateAppearances"])
+            except Exception:
+                so = pa = 0.0
+            rec[hand] = so / pa if pa else None
+            so_all += so; pa_all += pa
+            tot[hand][0] += so; tot[hand][1] += pa
+        rec["all"] = so_all / pa_all if pa_all else None
+        by_team[normalize(t["name"])] = rec
+    league = {"L": tot["L"][0] / tot["L"][1], "R": tot["R"][0] / tot["R"][1],
+              "all": (tot["L"][0] + tot["R"][0]) / (tot["L"][1] + tot["R"][1])}
+    out = {"teams": by_team, "league": league}
+    if cache:
+        path.write_text(json.dumps(out, indent=2))
+    return out
+
+
+def _metrics(projes, actuals, lines, prob_fn) -> tuple:
+    """(bias, mae, mean-abs line-calibration-error) for a set of projections."""
+    n = len(actuals)
+    bias = sum(a - p for a, p in zip(actuals, projes)) / n
+    mae = sum(abs(a - p) for a, p in zip(actuals, projes)) / n
+    errs = []
+    for ln in lines:
+        mp = sum(prob_fn(p, ln) for p in projes) / n
+        af = sum(1 for a in actuals if a > ln) / n
+        errs.append(abs(mp - af))
+    return bias, mae, sum(errs) / len(errs)
+
+
+def calibrate_pitchers_gameaware(prior: int, test: int, min_gs: int = 15) -> dict:
+    """Project each start against that game's ACTUAL opponent, in 3 opponent
+    modes, so we can measure whether opponent/handedness awareness helps:
+      neutral  — no opponent adjustment (today's live baseline behavior)
+      overall  — opponent's overall K-rate vs league
+      hand     — opponent's K-rate vs the pitcher's handedness (the Phase-1 idea)
+    Opponent K-rates use the TEST season (same info the live model uses)."""
+    tbl = team_k_tables(test)
+    teams_k, league = tbl["teams"], tbl["league"]
+    csv = pd.read_csv(DATA / "pitcher_season_stats.csv")
+    pool = csv[(csv["season"] == prior) & (csv["games_started"] >= min_gs)
+               & (csv["k_per_9"] > 0) & (csv["innings_pitched"] > 0)]
+    print(f"  pitcher pool ({prior}, GS>={min_gs}): {len(pool)} starters — fetching {test} logs...")
+
+    actuals = []
+    proj = {"neutral": [], "overall": [], "hand": []}
+    n_pitchers = 0
+    for _, row in pool.iterrows():
+        base = (float(row["k_per_9"]) / 9.0) * _clamp(
+            float(row["innings_pitched"]) / float(row["games_started"]), 3.5, 7.0) * K_CAL
+        try:
+            res = statsapi.get("person", {"personId": int(row["player_id"]),
+                "hydrate": f"stats(group=[pitching],type=[gameLog],season={test},gameType=R)"})
+            person = res["people"][0]
+            hand = person.get("pitchHand", {}).get("code", "R")
+            splits = person["stats"][0]["splits"]
+        except Exception:
+            continue
+        starts = [s for s in splits if int(_f(s["stat"], "gamesStarted")) == 1]
+        if not starts:
+            continue
+        n_pitchers += 1
+        for s in starts:
+            opp = normalize(s.get("opponent", {}).get("name", ""))
+            rec = teams_k.get(opp, {})
+            adj_overall = (rec.get("all") or league["all"]) / league["all"]
+            hk = rec.get(hand)
+            adj_hand = (hk / league[hand]) if hk else 1.0
+            actuals.append(int(_f(s["stat"], "strikeOuts")))
+            proj["neutral"].append(base)
+            proj["overall"].append(base * adj_overall)
+            proj["hand"].append(base * adj_hand)
+
+    n = len(actuals)
+    print(f"\n{'='*64}\nPITCHER STRIKEOUTS — game-aware opponent test ({prior}→{test})\n{'-'*64}")
+    print(f"  Pitchers: {n_pitchers} | Starts: {n:,}")
+    print(f"  {'Opponent mode':<14}{'Bias':>8}{'MAE':>8}{'CalibErr':>10}")
+    results = {}
+    for mode in ("neutral", "overall", "hand"):
+        bias, mae, ce = _metrics(proj[mode], actuals, K_LINES, lambda lam, ln: over_prob(ln, lam))
+        results[mode] = {"bias": bias, "mae": mae, "calib_error": ce}
+        label = {"neutral": "neutral", "overall": "overall K%", "hand": "by handedness"}[mode]
+        print(f"  {label:<14}{bias:>+8.2f}{mae:>8.3f}{ce*100:>9.1f}%")
+    base_mae = results["neutral"]["mae"]
+    best = min(results, key=lambda m: results[m]["mae"])
+    print(f"\n  Best: {best}  (MAE {results[best]['mae']:.3f} vs neutral {base_mae:.3f}, "
+          f"{(results[best]['mae']-base_mae)/base_mae*100:+.1f}%)")
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description="Calibration backtest for prop models.")
     ap.add_argument("--prior", type=int, default=2024, help="season to build stats from")
@@ -183,11 +292,21 @@ def main():
     ap.add_argument("--batters-only", action="store_true")
     ap.add_argument("--raw", action="store_true",
                     help="disable the calibration corrections (see uncorrected model)")
+    ap.add_argument("--gameaware", action="store_true",
+                    help="game-aware pitcher test: compare neutral vs overall vs handedness opponent")
     args = ap.parse_args()
 
     if args.raw:
         global K_CAL, HIT_CAL
         K_CAL, HIT_CAL = 1.0, 1.0
+
+    if args.gameaware:
+        print(f"Game-aware backtest — {args.prior} stats project {args.test} starts "
+              f"vs each game's real opponent.")
+        calibrate_pitchers_gameaware(args.prior, args.test)
+        print("\nReading the result: lower MAE + lower CalibErr = the opponent feature helps. "
+              "If 'by handedness' wins, it's worth adding to the live model.")
+        return
 
     mode = "RAW (no correction)" if args.raw else \
         f"corrected (K×{K_CAL}, hit×{HIT_CAL})"

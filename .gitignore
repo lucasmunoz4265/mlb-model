@@ -10,3 +10,6 @@ migrate_to_supabase.py
 __pycache__/
 .DS_Store
 
+
+# Backtest cache (regenerable)
+data/team_k_by_hand_*.json
