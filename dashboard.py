@@ -68,14 +68,17 @@ def auto_update_pending():
     return buf.getvalue(), datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-@st.cache_data(ttl=300, show_spinner="Fetching FanDuel odds...")
+# 30-min cache (shared across all visitors) so loading the public app makes at
+# most ~2 paid fetches/hour. Only h2h + totals — spreads were fetched but never
+# used. Pre-game lines barely move, so 30 min is plenty fresh.
+@st.cache_data(ttl=1800, show_spinner="Fetching FanDuel odds...")
 def get_fanduel_odds(api_key):
     if not api_key:
         return [], None
     url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/"
     params = {
         "apiKey": api_key, "regions": "us",
-        "markets": "h2h,spreads,totals",
+        "markets": "h2h,totals",
         "bookmakers": "fanduel", "oddsFormat": "american",
     }
     r = requests.get(url, params=params, timeout=15)
