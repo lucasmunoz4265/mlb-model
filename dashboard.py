@@ -560,6 +560,36 @@ def main():
                 c3.metric("Profit", f"${profit:+.2f}", delta_color="normal")
                 c4.metric("ROI", f"{roi*100:+.2f}%")
 
+            def bet_label(row):
+                bt = str(row.get("bet_type") or "").lower()
+                desc = str(row.get("description") or "").strip()
+                if desc:
+                    return desc
+                team = row.get("bet_team") or "—"
+                return f"{team} ML" if bt == "moneyline" else team
+
+            def fmt_bets(d, extra_cols):
+                out = pd.DataFrame(index=d.index)
+                out["Date"] = d["game_date"]
+                out["Bet"] = d.apply(bet_label, axis=1)
+                out["Type"] = d["bet_type"].fillna("").str.capitalize()
+                out["Odds"] = pd.to_numeric(d["odds_american"], errors="coerce").apply(
+                    lambda x: format_american(int(x)) if pd.notna(x) else "—")
+                out["Stake"] = pd.to_numeric(d["stake"], errors="coerce").apply(
+                    lambda x: f"${x:.2f}" if pd.notna(x) else "—")
+                out["Edge"] = pd.to_numeric(d["edge"], errors="coerce").apply(
+                    lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "—")
+                for c in extra_cols:
+                    out[c] = d[c.lower()] if c.lower() in d.columns else "—"
+                return out
+
+            if not pending.empty:
+                st.subheader("⏳ Pending bets")
+                pend_view = pending.copy()
+                pend_view["Status"] = "pending"
+                st.dataframe(fmt_bets(pend_view, ["Status"]),
+                             use_container_width=True, hide_index=True)
+
             manual_pending = pending[
                 (pending["bet_type"].fillna("").astype(str).str.lower().isin(["other", "parlay"]))
                 | (pending["game_id"].fillna("").astype(str).str.strip() == "")
@@ -579,9 +609,10 @@ def main():
 
             if not finished.empty:
                 st.subheader("Recent results")
-                display_cols = ["game_date", "bet_team", "description", "odds_american", "stake", "source", "status", "profit"]
-                available_cols = [c for c in display_cols if c in finished.columns]
-                st.dataframe(finished[available_cols].tail(30), use_container_width=True, hide_index=True)
+                res = fmt_bets(finished, ["Status"])
+                res["Profit"] = pd.to_numeric(finished["profit"], errors="coerce").apply(
+                    lambda x: f"${x:+.2f}" if pd.notna(x) else "—")
+                st.dataframe(res.tail(30), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

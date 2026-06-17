@@ -152,5 +152,19 @@ def update_bet(bet_id, fields: dict) -> None:
     df.to_csv(LOG_FILE, index=False)
 
 
+def delete_bet(bet_id) -> None:
+    """Delete a single bet by id (Supabase) or index (CSV)."""
+    client = supabase_client()
+    if client:
+        try:
+            client.table("bet_log").delete().eq("id", int(bet_id)).execute()
+            return
+        except Exception as e:
+            print(f"Supabase delete failed: {e}, falling back to CSV")
+    df = read_all()
+    df = df.drop(index=bet_id, errors="ignore")
+    df.to_csv(LOG_FILE, index=False)
+
+
 def is_supabase_active() -> bool:
     return supabase_client() is not None
