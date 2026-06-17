@@ -6,6 +6,7 @@ data/pitcher_elo_history.csv
 data/features.csv
 data/gbm_predictions.csv
 data/bet_log.csv
+migrate_to_supabase.py
 __pycache__/
 .DS_Store
 

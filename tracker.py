@@ -10,71 +10,41 @@ import sys
 import warnings
 warnings.filterwarnings("ignore")
 
-from pathlib import Path
-
 import pandas as pd
 import statsapi
 
-DATA = Path(__file__).parent / "data"
-LOG_FILE = DATA / "bet_log.csv"
-
-COLUMNS = [
-    "logged_at", "game_date", "game_id", "home_team", "away_team",
-    "bet_side", "bet_team", "pitcher", "opp_pitcher",
-    "odds_american", "odds_decimal",
-    "model_p", "market_p", "edge", "stake",
-    "status", "actual_winner", "profit",
-    "source", "bet_type", "description",
-]
+from db import read_all, insert_or_update, update_bet, is_supabase_active
 
 
 def ensure_log() -> pd.DataFrame:
-    if not LOG_FILE.exists():
-        pd.DataFrame(columns=COLUMNS).to_csv(LOG_FILE, index=False)
-    df = pd.read_csv(LOG_FILE)
-    for col in COLUMNS:
-        if col not in df.columns:
-            df[col] = "" if col in ("source", "bet_type", "description") else None
-    return df
-
-
-def manual_resolve(idx: int, won: bool) -> None:
-    """Mark a manual bet as won/lost (for props that can't auto-resolve)."""
-    df = ensure_log()
-    row = df.iloc[idx]
-    stake = float(row["stake"])
-    decimal = float(row["odds_decimal"])
-    profit = stake * (decimal - 1) if won else -stake
-    df.at[idx, "status"] = "won" if won else "lost"
-    df.at[idx, "profit"] = round(profit, 2)
-    df.to_csv(LOG_FILE, index=False)
+    return read_all()
 
 
 def log_bet(row: dict) -> None:
-    """Append one recommended bet to the log as 'pending'.
-    If a pending bet already exists for this game+side, update it instead."""
-    df = ensure_log()
-    row = {**row, "status": "pending", "actual_winner": "", "profit": ""}
-    existing_mask = (
-        (df["game_id"].astype(str) == str(row["game_id"]))
-        & (df["bet_side"] == row["bet_side"])
-        & (df["status"] == "pending")
-    )
-    if existing_mask.any():
-        for col, val in row.items():
-            df.loc[existing_mask, col] = val
-    else:
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(LOG_FILE, index=False)
+    insert_or_update(row)
+
+
+def manual_resolve(bet_id, won: bool) -> None:
+    df = read_all()
+    if bet_id not in df.index:
+        return
+    row = df.loc[bet_id]
+    stake = float(row["stake"]) if pd.notna(row["stake"]) else 0
+    decimal = float(row["odds_decimal"]) if pd.notna(row["odds_decimal"]) else 0
+    profit = stake * (decimal - 1) if won else -stake
+    update_bet(bet_id, {
+        "status": "won" if won else "lost",
+        "profit": round(profit, 2),
+    })
 
 
 def update_pending() -> None:
-    df = ensure_log()
+    df = read_all()
     pending = df[df["status"] == "pending"]
     print(f"Checking {len(pending)} pending bets...")
     updated = 0
     skipped_manual = 0
-    for idx, row in pending.iterrows():
+    for bet_id, row in pending.iterrows():
         gid = row.get("game_id")
         if not gid or pd.isna(gid) or str(gid).strip() == "":
             skipped_manual += 1
@@ -84,7 +54,7 @@ def update_pending() -> None:
             skipped_manual += 1
             continue
         try:
-            games = statsapi.schedule(game_id=int(gid))
+            games = statsapi.schedule(game_id=int(float(gid)))
             if not games:
                 continue
             g = games[0]
@@ -92,40 +62,42 @@ def update_pending() -> None:
                 continue
             home_won = g["home_score"] > g["away_score"]
             bet_won = (row["bet_side"] == "home" and home_won) or (row["bet_side"] == "away" and not home_won)
-            stake = float(row["stake"])
-            decimal = float(row["odds_decimal"])
+            stake = float(row["stake"]) if pd.notna(row["stake"]) else 0
+            decimal = float(row["odds_decimal"]) if pd.notna(row["odds_decimal"]) else 0
             profit = stake * (decimal - 1) if bet_won else -stake
-            df.at[idx, "status"] = "won" if bet_won else "lost"
-            df.at[idx, "actual_winner"] = g["winning_team"]
-            df.at[idx, "profit"] = round(profit, 2)
+            update_bet(bet_id, {
+                "status": "won" if bet_won else "lost",
+                "actual_winner": g["winning_team"],
+                "profit": round(profit, 2),
+            })
             updated += 1
         except Exception as e:
-            print(f"  Error checking game {row['game_id']}: {e}")
-    df.to_csv(LOG_FILE, index=False)
+            print(f"  Error checking game {gid}: {e}")
     print(f"Updated {updated} bets. ({skipped_manual} manual bets skipped — resolve them in dashboard.)")
 
 
 def summary() -> None:
-    df = ensure_log()
+    df = read_all()
     if df.empty:
-        print("No bets logged yet. Run tonight.py to generate recommendations.")
+        print("No bets logged yet.")
         return
     finished = df[df["status"].isin(["won", "lost"])]
     pending = df[df["status"] == "pending"]
 
+    backend = "Supabase" if is_supabase_active() else "CSV (local)"
     print("=" * 60)
-    print("BET TRACKER — running performance")
+    print(f"BET TRACKER — running performance (storage: {backend})")
     print("=" * 60)
     print(f"  Total logged:    {len(df)}")
     print(f"  Pending:         {len(pending)}")
     print(f"  Completed:       {len(finished)}")
     if finished.empty:
-        print("\nNo completed bets yet — come back after games finish.")
+        print("\nNo completed bets yet.")
         return
 
-    finished["profit_num"] = finished["profit"].astype(float)
-    finished["stake_num"] = finished["stake"].astype(float)
-
+    finished = finished.copy()
+    finished["profit_num"] = pd.to_numeric(finished["profit"], errors="coerce").fillna(0)
+    finished["stake_num"] = pd.to_numeric(finished["stake"], errors="coerce").fillna(0)
     wins = (finished["status"] == "won").sum()
     losses = (finished["status"] == "lost").sum()
     total_wagered = finished["stake_num"].sum()
@@ -138,27 +110,16 @@ def summary() -> None:
     print(f"  Total profit:    ${total_profit:+.2f}")
     print(f"  ROI:             {roi*100:+.2f}%")
 
-    print("\nBy edge bucket:")
-    finished["edge_num"] = finished["edge"].astype(float)
-    for lo, hi in [(0.05, 0.08), (0.08, 0.12), (0.12, 0.20), (0.20, 1.0)]:
-        sub = finished[(finished["edge_num"] >= lo) & (finished["edge_num"] < hi)]
-        if len(sub) == 0:
-            continue
-        sub_wins = (sub["status"] == "won").sum()
-        sub_wagered = sub["stake_num"].sum()
-        sub_profit = sub["profit_num"].sum()
-        sub_roi = sub_profit / sub_wagered if sub_wagered > 0 else 0
-        print(f"  edge {lo:.0%}-{hi:.0%}: {len(sub):>3} bets, win {sub_wins/len(sub)*100:>4.1f}%, ROI {sub_roi*100:+5.2f}%")
-
 
 def recent(n: int = 20) -> None:
-    df = ensure_log()
+    df = read_all()
     if df.empty:
         print("No bets logged yet.")
         return
     print(f"Last {min(n, len(df))} bets logged:\n")
     cols = ["game_date", "bet_team", "odds_american", "edge", "stake", "status", "profit"]
-    print(df[cols].tail(n).to_string(index=False))
+    available_cols = [c for c in cols if c in df.columns]
+    print(df[available_cols].tail(n).to_string())
 
 
 if __name__ == "__main__":
