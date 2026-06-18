@@ -239,10 +239,11 @@ def calibrate_pitchers_gameaware(prior: int, test: int, min_gs: int = 15) -> dic
     print(f"  pitcher pool ({prior}, GS>={min_gs}): {len(pool)} starters — fetching {test} logs...")
 
     actuals = []
-    proj = {"neutral": [], "overall": [], "hand": []}
+    proj = {"neutral": [], "overall": [], "hand": [], "ip_ceiling": []}
     n_pitchers = 0
     for _, row in pool.iterrows():
-        base = (float(row["k_per_9"]) / 9.0) * _clamp(
+        k9_term = float(row["k_per_9"]) / 9.0
+        base = k9_term * _clamp(
             float(row["innings_pitched"]) / float(row["games_started"]), 3.5, 7.0) * K_CAL
         try:
             res = statsapi.get("person", {"personId": int(row["player_id"]),
@@ -262,25 +263,34 @@ def calibrate_pitchers_gameaware(prior: int, test: int, min_gs: int = 15) -> dic
             adj_overall = (rec.get("all") or league["all"]) / league["all"]
             hk = rec.get(hand)
             adj_hand = (hk / league[hand]) if hk else 1.0
+            actual_ip = _parse_ip(s["stat"].get("inningsPitched", 0))
             actuals.append(int(_f(s["stat"], "strikeOuts")))
             proj["neutral"].append(base)
             proj["overall"].append(base * adj_overall)
             proj["hand"].append(base * adj_hand)
+            # Diagnostic: perfect knowledge of THIS start's innings (look-ahead) —
+            # shows the ceiling of how much a better expected-innings model could help.
+            proj["ip_ceiling"].append(k9_term * actual_ip * K_CAL)
 
     n = len(actuals)
     print(f"\n{'='*64}\nPITCHER STRIKEOUTS — game-aware opponent test ({prior}→{test})\n{'-'*64}")
     print(f"  Pitchers: {n_pitchers} | Starts: {n:,}")
-    print(f"  {'Opponent mode':<14}{'Bias':>8}{'MAE':>8}{'CalibErr':>10}")
+    print(f"  {'Mode':<22}{'Bias':>8}{'MAE':>8}{'CalibErr':>10}")
     results = {}
-    for mode in ("neutral", "overall", "hand"):
+    labels = {"neutral": "neutral", "overall": "overall K%", "hand": "by handedness",
+              "ip_ceiling": "PERFECT-IP (ceiling)"}
+    for mode in ("neutral", "overall", "hand", "ip_ceiling"):
         bias, mae, ce = _metrics(proj[mode], actuals, K_LINES, lambda lam, ln: over_prob(ln, lam))
         results[mode] = {"bias": bias, "mae": mae, "calib_error": ce}
-        label = {"neutral": "neutral", "overall": "overall K%", "hand": "by handedness"}[mode]
-        print(f"  {label:<14}{bias:>+8.2f}{mae:>8.3f}{ce*100:>9.1f}%")
+        print(f"  {labels[mode]:<22}{bias:>+8.2f}{mae:>8.3f}{ce*100:>9.1f}%")
     base_mae = results["neutral"]["mae"]
-    best = min(results, key=lambda m: results[m]["mae"])
-    print(f"\n  Best: {best}  (MAE {results[best]['mae']:.3f} vs neutral {base_mae:.3f}, "
-          f"{(results[best]['mae']-base_mae)/base_mae*100:+.1f}%)")
+    realistic = ("neutral", "overall", "hand")
+    best = min(realistic, key=lambda m: results[m]["mae"])
+    print(f"\n  Best realistic feature: {best}  (MAE {results[best]['mae']:.3f} vs "
+          f"neutral {base_mae:.3f}, {(results[best]['mae']-base_mae)/base_mae*100:+.1f}%)")
+    ip_mae = results["ip_ceiling"]["mae"]
+    print(f"  Perfect-IP ceiling: MAE {ip_mae:.3f} ({(ip_mae-base_mae)/base_mae*100:+.1f}% vs neutral) "
+          f"— the MOST a better innings model could buy. If small, K variance is mostly irreducible.")
     return results
 
 
