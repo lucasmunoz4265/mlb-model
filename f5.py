@@ -94,10 +94,14 @@ def _acc_logloss(p, y):
 
 def backtest() -> None:
     from sklearn.linear_model import LogisticRegression
-    df = build_dataset()
+    full = build_dataset()
+    tie_rate = full["f5_tie"].mean()
+    # The F5 ML is 2-way with ties pushing, so the bet is decided ONLY among
+    # non-tied games — measure the model there.
+    df = full[full["f5_tie"] == 0].copy()
     seasons = sorted(df["season"].unique())
-    print(f"F5 dataset: {len(df):,} games, seasons {seasons[0]}–{seasons[-1]}")
-    print(f"  Home leads F5: {df['f5_home_win'].mean():.1%}  |  Ties through 5: {df['f5_tie'].mean():.1%}")
+    print(f"F5 dataset: {len(full):,} games ({len(df):,} decided), seasons {seasons[0]}–{seasons[-1]}")
+    print(f"  Ties through 5: {tie_rate:.1%} (these PUSH) | Home wins among decided: {df['f5_home_win'].mean():.1%}")
 
     # Walk-forward: train on all but the last 2 seasons, test on the last 2.
     test_seasons = seasons[-2:]
@@ -135,18 +139,57 @@ def backtest() -> None:
     print(f"  weighting is real signal. Ties ({df['f5_tie'].mean():.0%}) need a 3-way market treatment later.")
 
 
+def backtest_totals() -> None:
+    """F5 TOTAL runs model. Predict first-5 total from the starters' + offense
+    Elo, then Poisson around it for over/under, validated out-of-sample.
+    Totals are where the project notes say books are softest."""
+    from sklearn.linear_model import LinearRegression
+    from props import over_prob  # Poisson P(total > line)
+    df = build_dataset()
+    df["f5_total"] = df["h5"] + df["a5"]
+    seasons = sorted(df["season"].unique())
+    test_seasons = seasons[-2:]
+    train = df[~df["season"].isin(test_seasons)]
+    test = df[df["season"].isin(test_seasons)]
+
+    feats = ["pit_h", "pit_a", "team_h", "team_a"]
+    reg = LinearRegression().fit(train[feats].values, train["f5_total"].values)
+    pred = reg.predict(test[feats].values)
+    actual = test["f5_total"].values
+    mae = np.abs(pred - actual).mean()
+    base_pred = train["f5_total"].mean()
+    base_mae = np.abs(base_pred - actual).mean()
+
+    print(f"F5 TOTALS — {len(df):,} games, mean F5 total {df['f5_total'].mean():.2f} runs")
+    print(f"  Train {len(train):,} / Test {len(test):,}")
+    print(f"\n{'='*60}\nF5 TOTAL RUNS — out-of-sample\n{'-'*60}")
+    print(f"  Predict league-avg ({base_pred:.2f}) every game:  MAE {base_mae:.3f}")
+    print(f"  Elo-features model:                       MAE {mae:.3f}  ({(mae-base_mae)/base_mae*100:+.1f}%)")
+    print(f"\n  Over/under calibration (Poisson around predicted total):")
+    print(f"    {'Line':>5}{'ModelP(over)':>14}{'Actual over':>13}{'Diff':>7}")
+    for ln in (3.5, 4.5, 5.5):
+        mp = np.mean([over_prob(ln, max(0.5, p)) for p in pred])
+        af = (actual > ln).mean()
+        print(f"    {ln:>5.1f}{mp*100:>13.0f}%{af*100:>12.0f}%{(mp-af)*100:>+6.0f}%")
+    print(f"\n  Read: if the Elo model barely beats the league-avg baseline, win-based")
+    print(f"  Elo doesn't capture run environment — we'd need run stats (ERA/wOBA) for totals.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="F5 (first 5 innings) model + backtest.")
     ap.add_argument("--build", action="store_true", help="fetch + cache historical F5 results")
     ap.add_argument("--start", type=int, default=2022)
     ap.add_argument("--end", type=int, default=2025)
-    ap.add_argument("--backtest", action="store_true", help="run the F5 backtest")
+    ap.add_argument("--backtest", action="store_true", help="run the F5 win backtest")
+    ap.add_argument("--totals", action="store_true", help="run the F5 totals backtest")
     args = ap.parse_args()
     if args.build:
         build(args.start, args.end)
     if args.backtest:
         backtest()
-    if not (args.build or args.backtest):
+    if args.totals:
+        backtest_totals()
+    if not (args.build or args.backtest or args.totals):
         ap.print_help()
 
 
